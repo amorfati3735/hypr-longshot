@@ -16,3 +16,6 @@ env/
 *.jpg
 temp/
 
+# compiled overlay binary (build with gcc, see README)
+longshot_overlay
+

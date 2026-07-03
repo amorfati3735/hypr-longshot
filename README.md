@@ -8,8 +8,8 @@ This tool combines a `bash` script for workflow management, a `C` program (`rayl
 
 This is NOT a universal, plug-and-play `Wayland` tool. I built this primarily to suit my personal `archlinux` + `Hyprland` setup. Please read the following before `git clone`.
 
-1. **Hyprland Exclusive:** Parts of the program relie on `hyprctl` commands to position the recording overlay (`longshot_overlay`). It will not originally work on `Sway`, `Niri`, `GNOME` or `KDE Wayland`.
-2. **Waybar Integration:** The `bash` scripts `longshot.sh` contains hardcoded signals (`pkill -RTMIN+8 waybar`) to update `waybar` modules. **You may need to comment out or modify these lines in `longshot.sh` if you don't use this specific Waybar setup.**
+1. **Hyprland Exclusive:** Parts of the program rely on `hyprctl` commands to position the recording overlay (`longshot_overlay`). It will not work on `Sway`, `Niri`, `GNOME` or `KDE Wayland`. It also relies on the `hyprctl eval` dispatch API introduced in `Hyprland 0.55`, so older versions won't work either.
+2. **Waybar Integration:** `longshot.sh` exposes a `status` subcommand (`idle`/`selecting`/`recording`/`stitching`) meant to be polled by a Waybar custom module — see the example under [Usage](#usage). **If you don't use Waybar, you can safely ignore this and just drive the tool with `start`/`stop`/`cancel`.**
 3. **Hardcoded Paths:** Captured images are saved to `$HOME/Pictures/longshots/`. Ensure this path works for you.
 
 ## Dependencies
@@ -50,36 +50,63 @@ chmod +x longshot.sh
 
 ## Usage
 
-add this in `~/.config/hypr/hyprland.conf`:
+Hyprland has moved to a `Lua`-based config (`hyprlang` block syntax is deprecated). Add this window rule wherever you keep your Lua config (e.g. `~/.config/hypr/configuration/rules.lua`):
+```lua
+hl.window_rule({
+    name  = "longshot-overlay-rules",
+    match = { class = "^(longshot_overlay)$" },
+    float            = true,
+    border_size      = 0,
+    rounding         = 0,
+    no_blur          = true,
+    no_shadow        = true,
+    no_initial_focus = true,
+    no_focus         = true,
+    pin              = true,
+    suppress_event   = "activatefocus maximize fullscreen",
+})
 ```
-windowrule {
-    name = longshot-overlay-rules
-    match:class = ^(longshot_overlay)$
-    float = true
-    border_size = 0
-    rounding = 0
-    no_blur = true
-    no_shadow = true
-    no_initial_focus = true
-    no_focus = true
-    pin = true
-    suppress_event = activatefocus maximize fullscreen
+
+`longshot.sh` is driven by subcommands rather than being run bare:
+```bash
+./longshot.sh start   # select an area and begin recording
+./longshot.sh stop    # stop recording and stitch the result
+./longshot.sh cancel  # abort and discard whatever is in progress
+./longshot.sh status  # print idle | selecting | recording | stitching
+```
+
+To drive it from Waybar, poll `status` for the icon/class and dispatch `start`/`stop`/`cancel` on click, e.g. in your Waybar config:
+```jsonc
+"custom/longshot": {
+    "format": "{icon}",
+    "format-icons": {
+        "idle": "󰹑",
+        "selecting": "󰆞",
+        "recording": "🔴",
+        "stitching": "󰑮"
+    },
+    "exec": "state=$(~/hypr-longshot/longshot.sh status); echo \"{\\\"alt\\\": \\\"$state\\\", \\\"class\\\": \\\"$state\\\"}\"",
+    "return-type": "json",
+    "interval": 1,
+    "on-click": "if [ $(~/hypr-longshot/longshot.sh status) = 'idle' ]; then ~/hypr-longshot/longshot.sh start; else ~/hypr-longshot/longshot.sh stop; fi &",
+    "on-click-right": "~/hypr-longshot/longshot.sh cancel &",
+    "tooltip": true,
+    "tooltip-format": "左键: 开始/结束长截图\n右键: 直接取消并丢弃"
 }
 ```
-to activate `waybar`, check my configuration in the repository `Arch-config`.
 
 **How to capture:**
-1. run `longshot.sh`
+1. run `longshot.sh start` (or click the Waybar module)
 2. select the area you want to capture
 3. Slowly scroll down the page you want to capture.
-4. Click the button in `waybar` or press any key in the running terminal to stop
+4. run `longshot.sh stop` (or click the Waybar module again) to stop
 5. wait a seconds for the stitching work.
 
 **How it works**
-1. `longshot.sh` triggers `slurp` to get geometry.
+1. `longshot.sh start` triggers `slurp` to get geometry.
 2. It starts `wf-recorder` to record that specific region into a temporary `/tmp/longshot_temp.mp4`.
-3. It dispatches a `raylib` C window (`longshot_overlay`) via `hyprctl` to strictly cover the selected area with a blinking red border.
-4. Once recording stops, the Python script (`stitcher.py`) reads the video, analyzes frame movements using OpenCV's template matching (`cv2.matchTemplate`), and perfectly stitches the unique parts together into a `PNG`.
+3. It dispatches a `raylib` C window (`longshot_overlay`) via `hyprctl eval` to strictly cover the selected area with a blinking red border.
+4. Once `longshot.sh stop` is run, the Python script (`stitcher.py`) reads the video, calibrates a "sticky" region (fixed headers/footers that shouldn't be duplicated), tracks scroll offsets between sampled frames with OpenCV's phase correlation (`cv2.phaseCorrelate`), and stitches the unique parts together into a `PNG`.
 
 ## Known Bugs & Quirks
 

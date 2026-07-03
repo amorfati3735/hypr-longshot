@@ -28,8 +28,7 @@ static int safe_parse_dim(const char *s) {
 
 int main(int argc, char **argv) {
   SetConfigFlags(FLAG_WINDOW_UNDECORATED | FLAG_WINDOW_TRANSPARENT |
-                 FLAG_WINDOW_TOPMOST | FLAG_WINDOW_MOUSE_PASSTHROUGH |
-                 FLAG_WINDOW_RESIZABLE);
+                 FLAG_WINDOW_TOPMOST | FLAG_WINDOW_MOUSE_PASSTHROUGH);
 
   int width = DEFAULT_W;
   int height = DEFAULT_H;
