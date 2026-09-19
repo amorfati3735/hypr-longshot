@@ -9,7 +9,9 @@ TEMP_VIDEO="/tmp/longshot_temp.mp4"
 WF_LOG="/tmp/longshot_wf.log"
 OUTPUT_DIR="$HOME/Pictures/longshots"
 PID_FILE="/tmp/longshot_recording.pid"
-PADDING=10
+STITCH_LOG="/tmp/longshot_stitch.log"
+# Border is drawn exactly over the recorded box (0 = no framing margin).
+PADDING=0
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -24,7 +26,10 @@ cleanup_overlay() {
 }
 
 cleanup_temp() {
-  rm -f "$TEMP_VIDEO" "$WF_LOG"
+  # Keep the source video + logs by default while debugging. Set LONGSHOT_KEEP_VIDEO=0
+  # (or rm /tmp/longshot_temp.mp4 manually) to free space afterwards.
+  rm -f "$WF_LOG"
+  [ "${LONGSHOT_KEEP_VIDEO:-1}" = "0" ] && rm -f "$TEMP_VIDEO"
 }
 
 
@@ -55,13 +60,13 @@ cmd_cancel() {
   cleanup_overlay
   cleanup_temp
 
-  notify-send -u normal "Longshot" "长截图已取消"
+  notify-send -u normal "Longshot" "Cancelled — recording discarded"
   echo "Cancelled all operations."
 }
 
 cmd_start() {
   if [ "$(cmd_status)" != "idle" ]; then
-    notify-send -u normal "Longshot" "当前已有任务正在进行"
+    notify-send -u normal "Longshot" "A longshot task is already in progress"
     exit 1
   fi
 
@@ -84,10 +89,26 @@ cmd_start() {
   local oW=$((W + PADDING * 2))
   local oH=$((H + PADDING * 2))
 
-  hyprctl eval "hl.dispatch(hl.dsp.exec_cmd('[no_anim; move $oX $oY; size $oW $oH] ${OVERLAY_BIN} $oW $oH'))" \
-    >/dev/null 2>&1
+  # Spawn the blinking-border overlay and place it over the recorded area.
+  # NOTE: `hyprctl eval` (Lua) is unavailable on classic hyprlang configs, so we
+  # spawn via `dispatch exec` and position with xdotool. Hyprland maps new
+  # floating windows CENTERED, so poll until the window exists before moving it;
+  # the single-shot 0.5s wait was too short for raylib to finish mapping.
+  (hyprctl dispatch exec -- "$OVERLAY_BIN" "$oW" "$oH" >/dev/null 2>&1 &)
+  OWID=""
+  for _ in $(seq 1 15); do          # wait up to ~3s for the overlay to map
+    OWID=$(xdotool search --class longshot_overlay 2>/dev/null | tail -1)
+    [ -n "$OWID" ] && break
+    sleep 0.2
+  done
+  if [ -n "$OWID" ]; then
+    xdotool windowmove "$OWID" "$oX" "$oY" >/dev/null 2>&1
+    xdotool windowsize "$OWID" "$oW" "$oH" >/dev/null 2>&1
+  else
+    echo "[warn] overlay window not detected in time; it may stay at center" >&2
+  fi
 
-  notify-send -t 3000 "🔴 Longshot" "开始录制，请缓慢向下滚动网页\n完成后再次点击图标"
+  notify-send -t 3000 "🔴 Longshot" "Recording started — scroll the page slowly, then press the key again to stop"
   echo "Started recording. PID: $REC_PID"
 }
 
@@ -109,20 +130,25 @@ cmd_stop() {
   cleanup_overlay
   rm -f "$PID_FILE"
 
-  notify-send -t 3000 "Longshot" "正在拼接图像，请稍候..."
+  notify-send -t 3000 "Longshot" "Stitching long image, please wait..."
   local out_img="$OUTPUT_DIR/longshot_$(date +%s).png"
 
   if [ ! -f "$TEMP_VIDEO" ]; then
     die "Temp video missing, stitching aborted."
   fi
 
-  "$PYTHON_EXEC" "$SCRIPT_DIR/stitcher.py" "$TEMP_VIDEO" "$out_img"
+  # Run the stitcher and capture everything (incl. per-segment debug) to a log.
+  LONGSHOT_DEBUG="${LONGSHOT_DEBUG:-1}" \
+    "$PYTHON_EXEC" "$SCRIPT_DIR/stitcher.py" "$TEMP_VIDEO" "$out_img" >"$STITCH_LOG" 2>&1
+  local rc=$?
 
   if [ -f "$out_img" ]; then
-    notify-send -i "$out_img" "✅ Longshot" "长截图已生成: $out_img"
+    notify-send -i "$out_img" "✅ Longshot" "Longshot saved: $out_img"
     cleanup_temp
   else
-    die "Failed to generate longshot"
+    echo "----- stitcher log (last 40 lines) -----" >&2
+    tail -40 "$STITCH_LOG" >&2
+    die "Failed to generate longshot (see stitcher log /tmp/longshot_stitch.log, rc=$rc)"
   fi
 }
 

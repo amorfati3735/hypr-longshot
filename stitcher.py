@@ -4,188 +4,175 @@ import sys
 import cv2
 import numpy as np
 
-CROP = 10                    # 边框裁剪像素
-TARGET_SAMPLE_FPS = 10       # 目标采样帧率
-MIN_MOVEMENT = 5             # 最小有效滚动像素
-MIN_RESPONSE = 0.20          # phaseCorrelate 置信度阈值
-STATIC_DY = 1.0              # |dy| 小于此值视为静态
-STICKY_CALIB_FRAMES = 6      # sticky 区域校准所用采样帧数
-STICKY_ROW_THRESH = 1.5      # 平均逐行差异低于此值的行视为不动
-PREV_AGING_LIMIT = 30        # 连续未匹配次数上限,超过则强制刷新 prev
-VSTACK_BATCH = 64            # 增量合并阈值,控制 slices 列表长度
+# ---- Robust scrolling-longshot stitcher -------------------------------------
+# Replaces the phase-correlation approach (which was direction-locked and
+# fragile on real content) with a two-pass method:
+#   Pass 1: find the ACTIVE (scrolling) band by accumulating row-level change
+#           across the whole video -> sticky header/footer are excluded.
+#   Pass 2: measure the vertical shift between consecutive sampled frames with
+#           1D normalized cross-correlation of the row profile over that band,
+#           and stitch by appending/prepending the newly-revealed strip. Both
+#           scroll directions are supported.
 
-cv2.ocl.setUseOpenCL(False)
+CROP = 10                 # px trimmed from each edge (recording border)
+TARGET_SAMPLE_FPS = 10.0  # desired sampling rate for analysis/stitching
+STICKY_THRESH = 1.5       # avg per-row |diff| below which a row counts as sticky
+STATIC_TOL = 2.0          # |dy| below this is considered static
+MIN_CONF = 0.40           # min NCC confidence to trust a shift
+REFRESH_CONF = 0.25       # below this, don't even refresh the reference frame
+MAX_SHIFT_FRAC = 0.55     # max |dy| as a fraction of active height (no-overlap guard)
+BATCH = 64                # consolidate strips every BATCH to bound memory
+
+DEBUG = os.environ.get("LONGSHOT_DEBUG") == "1"
 
 
-def detect_sticky_rows(grays: list[np.ndarray], h: int, thresh: float) -> tuple[int, int]:
-    """根据校准帧序列推断 sticky top/bottom 行索引。
+def _info(msg):
+    print(f"[INFO] {msg}")
 
-    思路:累计相邻帧的逐行 abs diff,从顶部/底部开始连续接近 0 的行视为 sticky。
-    返回 (active_top, active_bot),拼接时只使用 [active_top, active_bot) 区域。
-    """
-    if len(grays) < 2:
-        return 0, h
 
-    accum = np.zeros(h, dtype=np.float64)
-    for a, b in zip(grays[:-1], grays[1:]):
-        accum += np.abs(a.astype(np.int32) - b.astype(np.int32)).mean(axis=1)
-    accum /= len(grays) - 1
-
+def _active_band(video, si):
+    """Return (top, bot) rows of the region that actually scrolls."""
+    cap = cv2.VideoCapture(video)
+    ok, first = cap.read()
+    if not ok:
+        print("[ERROR] Cannot open video: " + video, file=sys.stderr)
+        sys.exit(1)
+    first = first[CROP:-CROP, CROP:-CROP]
+    h, w = first.shape[:2]
+    c0, c1 = int(w * 0.20), int(w * 0.80)
+    gprev = cv2.cvtColor(first, cv2.COLOR_BGR2GRAY)
+    acc = np.zeros(h, np.float64)
+    n = 0
+    fc = 0
+    while True:
+        ret, fr = cap.read()
+        if not ret:
+            break
+        fc += 1
+        if fc % si != 0:
+            continue
+        g = cv2.cvtColor(fr[CROP:-CROP, CROP:-CROP], cv2.COLOR_BGR2GRAY)
+        acc += np.abs(gprev[:, c0:c1].astype(np.int32) - g[:, c0:c1].astype(np.int32)).mean(axis=1)
+        gprev = g
+        n += 1
+    cap.release()
+    acc /= max(1, n)
     top = 0
-    while top < h and accum[top] < thresh:
+    while top < h and acc[top] < STICKY_THRESH:
         top += 1
-
     bot = h
-    while bot > top and accum[bot - 1] < thresh:
+    while bot > top and acc[bot - 1] < STICKY_THRESH:
         bot -= 1
+    return top, bot, (c0, c1), n
 
-    return top, bot
+
+def _row_profile(gray, c0, c1):
+    return gray[:, c0:c1].mean(axis=1, dtype=np.float32)
 
 
-def stitch_video(video_path: str, output_path: str) -> None:
+def _ncc_shift(pa, pb, maxshift):
+    """Best integer vertical shift + NCC confidence between two row profiles."""
+    am = pa - pa.mean()
+    bm = pb - pb.mean()
+    if np.linalg.norm(am) < 1e-6 or np.linalg.norm(bm) < 1e-6:
+        return 0, 0.0
+    best_c, best_dy = 0.0, 0
+    for dy in range(-maxshift, maxshift + 1):
+        if dy < 0:
+            a, b = am[:dy], bm[-dy:]
+        elif dy > 0:
+            a, b = am[dy:], bm[:-dy]
+        else:
+            a, b = am, bm
+        if len(a) < 10:
+            continue
+        c = float(np.dot(a, b)) / (float(np.linalg.norm(a)) * float(np.linalg.norm(b)) + 1e-9)
+        if c > best_c:
+            best_c, best_dy = c, dy
+    return best_dy, best_c
+
+
+def stitch_video(video_path, output_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"[ERROR] Cannot open video: {video_path}", file=sys.stderr)
         sys.exit(1)
+    ok, first = cap.read()
+    if not ok:
+        print("[ERROR] Video file is empty.", file=sys.stderr)
+        sys.exit(1)
+    first = first[CROP:-CROP, CROP:-CROP]
+    h, w = first.shape[:2]
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.release()
+    si = max(1, round(src_fps / TARGET_SAMPLE_FPS))
+    _info(f"{w}x{h} @ {src_fps:.1f}fps | sample every {si}")
 
+    # ---- Pass 1: active band ----
+    top, bot, (c0, c1), n = _active_band(video_path, si)
+    ah = bot - top
+    if ah < int(h * 0.15):
+        _info(f"Active band too small ({ah}px), using full frame")
+        top, bot, ah = 0, h, h
+    else:
+        _info(f"Active region: rows [{top}, {bot}) ({ah}/{h}px)")
+
+    # ---- Pass 2: stitch ----
+    cap = cv2.VideoCapture(video_path)
+    cap.read()  # discard duplicate first frame (already read)
+    gprev = cv2.cvtColor(first, cv2.COLOR_BGR2GRAY)
+    strips: list = [first]
+    max_shift = int(ah * MAX_SHIFT_FRAC)
+    appended = 0
+    prepended = 0
+    fc = 0
     try:
-        ret, first_frame = cap.read()
-        if not ret:
-            print("[ERROR] Video file is empty.", file=sys.stderr)
-            sys.exit(1)
-
-        first_frame = first_frame[CROP:-CROP, CROP:-CROP]
-        h, w = first_frame.shape[:2]
-        center_start, center_end = int(w * 0.25), int(w * 0.75)
-
-        src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        sample_interval = max(1, round(src_fps / TARGET_SAMPLE_FPS))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        print(
-            f"[INFO] {w}x{h} @ {src_fps:.1f}fps | "
-            f"~{total_frames} frames | sample every {sample_interval}"
-        )
-
-        # ---------- Phase 1: Sticky 区域校准 ----------
-        gray_first = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
-        calib_grays = [gray_first]
-        frame_count = 0
-
-        while len(calib_grays) < STICKY_CALIB_FRAMES:
+        while True:
             ret, fr = cap.read()
             if not ret:
                 break
-            frame_count += 1
-            if frame_count % sample_interval != 0:
+            fc += 1
+            if fc % si != 0:
                 continue
             fr = fr[CROP:-CROP, CROP:-CROP]
-            calib_grays.append(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY))
-
-        sticky_top, sticky_bot = detect_sticky_rows(calib_grays, h, STICKY_ROW_THRESH)
-        active_h = sticky_bot - sticky_top
-
-        if active_h < h * 0.3:
-            print(
-                f"[WARN] Sticky detection unreliable ({active_h}px active), "
-                f"falling back to full frame",
-                file=sys.stderr,
-            )
-            sticky_top, sticky_bot = 0, h
-            active_h = h
-        else:
-            print(
-                f"[INFO] Active region: rows [{sticky_top}, {sticky_bot}) "
-                f"({active_h}/{h}px)"
-            )
-
-        active_w = center_end - center_start
-        # Hanning 窗减小 FFT 边缘伪影,提升 phaseCorrelate 精度
-        hann = cv2.createHanningWindow((active_w, active_h), cv2.CV_32F)
-
-        # ---------- Phase 2: 拼接初始化 ----------
-        # 第一帧只保留到 sticky_bot,删除底部固定栏避免出现在结果中间
-        slices: list[np.ndarray] = [first_frame[:sticky_bot, :]]
-
-        gray_prev = calib_grays[-1]
-        gray_prev_active = gray_prev[sticky_top:sticky_bot, center_start:center_end]
-
-        stitch_count = 0
-        aging = 0
-
-        # ---------- Phase 3: 主循环 ----------
-        while True:
-            ret, curr_frame = cap.read()
-            if not ret:
-                break
-            frame_count += 1
-            if frame_count % sample_interval != 0:
-                continue
-
-            curr_frame = curr_frame[CROP:-CROP, CROP:-CROP]
-            gray_curr = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
-            gray_curr_active = gray_curr[sticky_top:sticky_bot, center_start:center_end]
-
-            # 一次相位相关同时拿到位移和置信度,取代两段 matchTemplate
-            (_dx, raw_dy), response = cv2.phaseCorrelate(
-                np.float32(gray_prev_active),
-                np.float32(gray_curr_active),
-                hann,
-            )
-            dy = -raw_dy  # 正值 = 内容向上滚动,出现新内容
-
-            # 静态/反向/低置信度统一处理
-            if abs(dy) < STATIC_DY or dy < MIN_MOVEMENT or response < MIN_RESPONSE:
-                aging += 1
-                if aging > PREV_AGING_LIMIT:
-                    # prev 太老,强制刷新避免越拖越无法对齐
-                    gray_prev = gray_curr
-                    gray_prev_active = gray_curr_active
-                    aging = 0
-                continue
-
-            dy_int = int(round(dy))
-            if dy_int >= active_h:
-                # 单步滚动超出有效高度,无法保证连续 -> 仅刷新 prev
-                gray_prev = gray_curr
-                gray_prev_active = gray_curr_active
-                aging = 0
-                continue
-
-            # 从 curr 的 active 区域底部取新出现的内容
-            new_content = curr_frame[sticky_bot - dy_int : sticky_bot, :]
-            if new_content.shape[0] > 0:
-                slices.append(new_content)
-                stitch_count += 1
-                # 增量合并,防止 list 过长 + 让大数组连续分配
-                if len(slices) >= VSTACK_BATCH:
-                    slices = [np.vstack(slices)]
-
-            gray_prev = gray_curr
-            gray_prev_active = gray_curr_active
-            aging = 0
-
-        print(f"[INFO] Stitching {stitch_count} segments...")
-        result_img = np.vstack(slices)
-
-        out_dir = os.path.dirname(os.path.abspath(output_path))
-        if not os.path.isdir(out_dir):
-            print(f"[ERROR] Output directory does not exist: {out_dir}", file=sys.stderr)
-            sys.exit(1)
-
-        ok = cv2.imwrite(output_path, result_img)
-        if not ok:
-            print(f"[ERROR] Failed to write image: {output_path}", file=sys.stderr)
-            sys.exit(1)
-
-        print(f"[OK] {result_img.shape[1]}x{result_img.shape[0]}px → {output_path}")
-
+            g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
+            pa = _row_profile(gprev, c0, c1)[top:bot]
+            pb = _row_profile(g, c0, c1)[top:bot]
+            dy, conf = _ncc_shift(pa, pb, max_shift)
+            if DEBUG:
+                print(f"[DBG] f{fc} dy={dy:7.1f} conf={conf:.3f}")
+            if conf >= MIN_CONF and abs(dy) >= STATIC_TOL:
+                k = int(round(abs(dy)))
+                if 0 < k <= ah:
+                    if dy > 0:  # content moved up -> new content at bottom
+                        strips.append(fr[bot - k:bot, :])
+                        appended += 1
+                    else:       # content moved down -> new content at top
+                        strips.insert(0, fr[top:top + k, :])
+                        prepended += 1
+                if len(strips) >= BATCH:
+                    strips = [np.concatenate(strips, axis=0)]
+                gprev = g
+            elif conf >= REFRESH_CONF:
+                gprev = g
     finally:
         cap.release()
+
+    _info(f"Stitched {appended} bottom + {prepended} top segments")
+    result_img = np.concatenate(strips, axis=0) if len(strips) > 1 else strips[0]
+
+    out_dir = os.path.dirname(os.path.abspath(output_path))
+    if not os.path.isdir(out_dir):
+        print(f"[ERROR] Output directory does not exist: {out_dir}", file=sys.stderr)
+        sys.exit(1)
+    if not cv2.imwrite(output_path, result_img):
+        print(f"[ERROR] Failed to write image: {output_path}", file=sys.stderr)
+        sys.exit(1)
+    print(f"[OK] {result_img.shape[1]}x{result_img.shape[0]}px -> {output_path}")
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("Usage: python stitcher.py <input_video> <output_image>", file=sys.stderr)
         sys.exit(1)
-
     stitch_video(sys.argv[1], sys.argv[2])
